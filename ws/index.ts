@@ -1,159 +1,273 @@
-import { WebSocketServer, WebSocket } from "ws";
-import jwt, { JwtPayload } from "jsonwebtoken";
-import { AuthenticatedWebSocket } from "./types";
-import { connectedUsers } from "./store";
-import { joinRoom, leaveAllRooms } from "./room.helpers";
-import { Chat } from "../models/Chat";
-import { chatRooms } from "./rooms";
-import { Message } from "../models/Message";
+import WebSocket, { WebSocketServer } from "ws";
+import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
+import { Conversation } from "../models/conversation";
 
-interface MyJwtPayload extends JwtPayload {
+interface WsUser {
   userId: string;
   role: string;
+  joined: Set<string>;
 }
 
-export const initWebSocket = (server: any) => {
+interface WsWithUser extends WebSocket {
+  user?: WsUser;
+}
+
+interface InMemoryConversation {
+  participants: Set<WsWithUser>;
+  messages: any[];
+}
+
+const activeConversations = new Map<string, InMemoryConversation>();
+
+function send(ws: WebSocket, event: string, data: any) {
+  ws.send(JSON.stringify({ event, data }));
+}
+
+function getTokenFromReq(req: any): string | null {
+  const url = req.url || "";
+  const params = new URLSearchParams(url.split("?")[1]);
+  return params.get("token");
+}
+
+function verifyToken(token: string) {
+  const decoded = jwt.verify(token, process.env.JWT_SECRET!);
+  if (
+    typeof decoded !== "object" ||
+    !("userId" in decoded) ||
+    !("role" in decoded)
+  ) {
+    throw new Error("Invalid token");
+  }
+  return decoded as { userId: string; role: string };
+}
+
+export function initWebSocket(server: any) {
   const wss = new WebSocketServer({ server });
 
-  console.log("WebSocket server initialized");
-
-  wss.on("connection", (ws: AuthenticatedWebSocket, req) => {
-    console.log("New WebSocket connection");
-
+  wss.on("connection", (ws: WsWithUser, req) => {
     try {
-      const url = req.url;
-      const params = new URLSearchParams(url?.split("?")[1]);
-      const token = params.get("token");
+      const token = getTokenFromReq(req);
+      if (!token) throw new Error();
 
-      if (!token) {
-        ws.close(1008, "Token missing");
-        return;
-      }
-
-      const decoded = jwt.verify(token, process.env.JWT_SECRET as string);
-
-      if (
-        !decoded ||
-        typeof decoded === "string" ||
-        !("userId" in decoded) ||
-        !("role" in decoded)
-      ) {
-        ws.close(1008, "Invalid token");
-        return;
-      }
-
-      const payload = decoded as MyJwtPayload;
+      const decoded = verifyToken(token);
 
       ws.user = {
-        userId: payload.userId,
-        role: payload.role,
+        userId: decoded.userId,
+        role: decoded.role,
+        joined: new Set(),
       };
-
-      console.log(
-        `WS Authenticated: userId=${payload.userId}, role=${payload.role}`
-      );
-
-      ws.on("message", async (data) => {
-        const message = JSON.parse(data.toString());
-
-        if (message.type === "join_chat") {
-          const { chatId } = message;
-
-          if (!chatId) {
-            ws.send(JSON.stringify({ error: "chatId required" }));
-            return;
-          }
-
-          const chat = await Chat.findById(chatId);
-          if (!chat) {
-            ws.send(JSON.stringify({ error: "Chat not found" }));
-            return;
-          }
-
-          if (chat.status === "closed") {
-            ws.send(JSON.stringify({ error: "Chat is closed" }));
-            return;
-          }
-
-          const userId = ws.user!.userId;
-
-          const isUser = chat.userId.toString() === userId;
-
-          const isAgent = chat.agentId?.toString() === userId;
-
-          if (!isUser && !isAgent) {
-            ws.send(JSON.stringify({ error: "Not authorized for this chat" }));
-            return;
-          }
-
-          joinRoom(chatId, ws);
-
-          console.log(`User ${userId} joined chat ${chatId}`);
-
-          ws.send(
-            JSON.stringify({
-              type: "joined_chat",
-              chatId,
-            })
-          );
-        }
-        /////////////////////
-
-        if (message.type === "message") {
-          const { chatId, content } = message;
-
-          if (!chatId || !content) {
-            ws.send(JSON.stringify({ error: "chatId and content required" }));
-            return;
-          }
-
-          const room = chatRooms.get(chatId);
-
-          if (!room || !room.has(ws)) {
-            ws.send(JSON.stringify({ error: "You are not part of this chat" }));
-            return;
-          }
-
-          const savedMessage = await Message.create({
-            chatId,
-            senderId: ws.user!.userId,
-            senderRole: ws.user!.role,
-            content,
-          });
-
-          const payload = {
-            type: "message",
-            chatId,
-            messageId: savedMessage._id,
-            from: {
-              userId: ws.user!.userId,
-              role: ws.user!.role,
-            },
-            content: savedMessage.content,
-            createdAt: savedMessage.createdAt,
-          };
-
-          for (const client of room) {
-            if (client.readyState === client.OPEN) {
-              client.send(JSON.stringify(payload));
-            }
-          }
-        }
-      });
-
-      // ws.on("close", () => {
-      //   console.log("WebSocket disconnected");
-      // });
-      ws.on("close", () => {
-        leaveAllRooms(ws);
-
-        if (ws.user?.userId) {
-          connectedUsers.delete(ws.user.userId);
-          console.log(`Disconnected: ${ws.user.userId}`);
-        }
-      });
-    } catch (err) {
-      ws.close(1008, "Authentication failed");
+    } catch {
+      send(ws, "ERROR", { message: "Unauthorized or invalid token" });
+      ws.close();
+      return;
     }
+
+    ws.on("message", async (raw) => {
+      let parsed: any;
+
+      try {
+        parsed = JSON.parse(raw.toString());
+      } catch {
+        return send(ws, "ERROR", { message: "Invalid message format" });
+      }
+
+      const { event, data } = parsed;
+      if (!event) {
+        return send(ws, "ERROR", { message: "Unknown event" });
+      }
+
+      if (event === "JOIN_CONVERSATION") {
+        if (!data?.conversationId) {
+          return send(ws, "ERROR", { message: "Invalid request schema" });
+        }
+
+        const { conversationId } = data;
+
+        if (!mongoose.Types.ObjectId.isValid(conversationId)) {
+          return send(ws, "ERROR", {
+            message: "Not allowed to access this conversation",
+          });
+        }
+
+        const conversation = await Conversation.findById(conversationId);
+        if (!conversation) {
+          return send(ws, "ERROR", {
+            message: "Not allowed to access this conversation",
+          });
+        }
+
+        if (conversation.status === "closed") {
+          return send(ws, "ERROR", {
+            message: "Conversation already closed",
+          });
+        }
+
+        const { role, userId } = ws.user!;
+
+        if (role === "supervisor" || role === "admin") {
+          return send(ws, "ERROR", {
+            message: "Forbidden for this role",
+          });
+        }
+
+        if (
+          role === "candidate" &&
+          conversation.candidateId.toString() !== userId
+        ) {
+          return send(ws, "ERROR", {
+            message: "Not allowed to access this conversation",
+          });
+        }
+
+        if (role === "agent" && conversation.agentId?.toString() !== userId) {
+          return send(ws, "ERROR", {
+            message: "Not allowed to access this conversation",
+          });
+        }
+
+        // In-memory conversation
+        if (!activeConversations.has(conversationId)) {
+          activeConversations.set(conversationId, {
+            participants: new Set(),
+            messages: conversation.messages || [],
+          });
+        }
+
+        const room = activeConversations.get(conversationId)!;
+        room.participants.add(ws);
+        ws.user!.joined.add(conversationId);
+
+        send(ws, "JOINED_CONVERSATION", {
+          conversationId,
+          status: conversation.status,
+        });
+        return;
+      }
+
+      if (event === "SEND_MESSAGE") {
+        if (!data?.conversationId || !data?.content) {
+          return send(ws, "ERROR", { message: "Invalid request schema" });
+        }
+
+        const { conversationId, content } = data;
+        const { role, userId } = ws.user!;
+
+        if (role === "supervisor" || role === "admin") {
+          return send(ws, "ERROR", {
+            message: "Forbidden for this role",
+          });
+        }
+
+        if (!ws.user!.joined.has(conversationId)) {
+          return send(ws, "ERROR", {
+            message: "You must join the conversation first",
+          });
+        }
+
+        const room = activeConversations.get(conversationId);
+        if (!room) return;
+
+        const message = {
+          conversationId,
+          senderId: userId,
+          senderRole: role,
+          content,
+          createdAt: new Date().toISOString(),
+        };
+
+        room.messages.push(message);
+
+        for (const client of room.participants) {
+          if (client !== ws) {
+            send(client, "NEW_MESSAGE", message);
+          }
+        }
+        return;
+      }
+
+      if (event === "LEAVE_CONVERSATION") {
+        if (!data?.conversationId) {
+          return send(ws, "ERROR", { message: "Invalid request schema" });
+        }
+
+        const { role } = ws.user!;
+        if (role === "supervisor" || role === "admin") {
+          return send(ws, "ERROR", {
+            message: "Forbidden for this role",
+          });
+        }
+
+        const { conversationId } = data;
+        const room = activeConversations.get(conversationId);
+        if (room) {
+          room.participants.delete(ws);
+        }
+
+        ws.user!.joined.delete(conversationId);
+
+        send(ws, "LEFT_CONVERSATION", { conversationId });
+        return;
+      }
+
+      if (event === "CLOSE_CONVERSATION") {
+        if (!data?.conversationId) {
+          return send(ws, "ERROR", { message: "Invalid request schema" });
+        }
+
+        const { conversationId } = data;
+        const { role, userId } = ws.user!;
+
+        if (role !== "agent") {
+          return send(ws, "ERROR", {
+            message: "Forbidden for this role",
+          });
+        }
+
+        const conversation = await Conversation.findById(conversationId);
+        if (!conversation) {
+          return send(ws, "ERROR", {
+            message: "Not allowed to access this conversation",
+          });
+        }
+
+        if (conversation.status === "closed") {
+          return send(ws, "ERROR", {
+            message: "Conversation already closed",
+          });
+        }
+
+        if (conversation.agentId?.toString() !== userId) {
+          return send(ws, "ERROR", {
+            message: "Not allowed to access this conversation",
+          });
+        }
+
+        if (conversation.status !== "assigned") {
+          return send(ws, "ERROR", {
+            message: "Conversation not yet assigned",
+          });
+        }
+
+        const room = activeConversations.get(conversationId);
+        if (room) {
+          conversation.messages = room.messages;
+        }
+
+        conversation.status = "closed";
+        await conversation.save();
+
+        if (room) {
+          for (const client of room.participants) {
+            send(client, "CONVERSATION_CLOSED", { conversationId });
+          }
+          activeConversations.delete(conversationId);
+        }
+
+        return;
+      }
+
+      send(ws, "ERROR", { message: "Unknown event" });
+    });
   });
-};
+}
