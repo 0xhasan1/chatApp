@@ -7,9 +7,10 @@ const userSchema = new Schema(
     password: { type: String, required: true },
     role: {
       type: String,
-      enum: ["user", "agent"],
+      enum: ["candidate", "user", "agent", "admin", "supervisor"],
       default: "user",
     },
+    supervisorId: { type: String, required: false },
   },
   { timestamps: true }
 );

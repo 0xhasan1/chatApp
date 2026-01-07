@@ -14,7 +14,7 @@ const messageSchema = new Schema(
     },
     senderRole: {
       type: String,
-      enum: ["user", "agent"],
+      enum: ["user", "agent", "admin", "supervisor"],
       required: true,
     },
     content: {

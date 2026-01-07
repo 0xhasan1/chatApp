@@ -5,6 +5,8 @@ import authRoutes from "../routes/auth.routes";
 import { initWebSocket } from "../ws/index";
 import http from "http";
 import chatRoutes from "../routes/chat.routes";
+import conversationRoutes from "../routes/conversations.routes";
+import adminRoutes from "../routes/admin.routes";
 
 dotenv.config();
 
@@ -16,6 +18,8 @@ initWebSocket(server);
 app.use("/auth", authRoutes);
 app.use("/user", authRoutes);
 app.use("/chat", chatRoutes);
+app.use("/conversations", conversationRoutes);
+app.use("/admin", adminRoutes);
 
 app.get("/health", (_, res) => {
   res.send("OK");
