@@ -126,7 +126,6 @@ export function initWebSocket(server: any) {
           });
         }
 
-        // In-memory conversation
         if (!activeConversations.has(conversationId)) {
           activeConversations.set(conversationId, {
             participants: new Set(),
